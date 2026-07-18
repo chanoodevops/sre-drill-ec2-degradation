@@ -23,7 +23,7 @@ Your task is to:
 | Component | Specification |
 | --------- | ------------- |
 | EC2 instance | `t2.micro` |
-| Operating system | Ubuntu 22.04 LTS |
+| Operating system | Ubuntu 22.04 LTS (recommended) or 24.04 LTS |
 | Root EBS | 10 GiB `gp3` |
 | Application | FastAPI + Uvicorn |
 | Reverse proxy | Nginx (port 80) |
@@ -33,8 +33,8 @@ Your task is to:
 
 | Port | Source | Purpose |
 | ---- | ------ | ------- |
-| TCP 22 | Student IP | SSH access |
-| TCP 80 | Student IP | HTTP via Nginx |
+| TCP 22 | Your IP | SSH access |
+| TCP 80 | Your IP | HTTP via Nginx |
 
 Port 3000 must not be publicly exposed.
 
@@ -150,5 +150,9 @@ Submit the following:
 
 ## References
 
-- [Deployment Guide](docs/deployment.md)
-- [API Reference](docs/api-reference.md)
+| Document | Description |
+|----------|-------------|
+| [Deployment Guide](docs/deployment.md) | Infrastructure setup and application deployment |
+| [API Reference](docs/api-reference.md) | Application endpoint documentation |
+| [Health Check Runbook](docs/health-check-runbook.md) | Troubleshooting, RCA, and recovery procedures |
+| [Disk Exhaustion Report](docs/disk-exhaustion-report.md) | Enterprise guide: detection, recovery, and prevention |

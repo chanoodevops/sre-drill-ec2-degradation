@@ -101,6 +101,14 @@ Verify:
 ls -ld /var/log/storage-breaker
 ```
 
+Expected: `drwxr-x---` permissions with `ubuntu` owner and group.
+
+Verify:
+
+```bash
+ls -ld /var/log/storage-breaker
+```
+
 ## 5. Create Python Virtual Environment
 
 ```bash
@@ -189,6 +197,9 @@ StandardError=journal
 
 NoNewPrivileges=true
 PrivateTmp=true
+
+# Log directory permissions are set during deployment (Step 4)
+# Application logs are created with 640 permissions
 
 [Install]
 WantedBy=multi-user.target
@@ -337,3 +348,13 @@ Confirm exactly **one** worker process is running.
 - [ ] Security Group allows ports 22 and 80
 - [ ] Health endpoint returns `200 OK`
 - [ ] Exactly one Uvicorn worker running
+
+---
+
+## See Also
+
+| Document | Description |
+|----------|-------------|
+| [API Reference](api-reference.md) | Application endpoint documentation |
+| [Health Check Runbook](health-check-runbook.md) | Troubleshooting, RCA, and recovery procedures |
+| [Disk Exhaustion Report](disk-exhaustion-report.md) | Enterprise guide: detection, recovery, and prevention |

@@ -42,7 +42,7 @@ This application intentionally writes large log files to fill the root filesyste
 | Resource         | Specification           |
 | ---------------- | ----------------------- |
 | EC2 instance     | `t2.micro`              |
-| Operating system | Ubuntu 22.04 LTS        |
+| Operating system | Ubuntu 22.04 LTS (recommended) or 24.04 LTS |
 | Root EBS volume  | 10 GiB (`gp3`)         |
 | Public IPv4      | Enabled                 |
 | Uvicorn workers  | 1 (required)            |
@@ -51,8 +51,8 @@ This application intentionally writes large log files to fill the root filesyste
 
 | Port | Source | Purpose |
 | ---- | ------ | ------- |
-| TCP 22 | Student public IP | SSH |
-| TCP 80 | Student public IP | Nginx HTTP |
+| TCP 22 | Your IP | SSH |
+| TCP 80 | Your IP | Nginx HTTP |
 
 > **Note:** Port 3000 must not be exposed publicly. Uvicorn listens only on `127.0.0.1`.
 
@@ -89,6 +89,7 @@ pip install -r requirements.txt
 ```bash
 sudo mkdir -p /var/log/storage-breaker
 sudo chown -R ubuntu:ubuntu /var/log/storage-breaker
+sudo chmod 750 /var/log/storage-breaker
 ```
 
 ### 5. Start Application
@@ -131,9 +132,10 @@ The `/health` endpoint returns:
 
 | Document | Description |
 | -------- | ----------- |
-| [Deployment Guide](docs/deployment.md) | Full deployment instructions |
-| [API Reference](docs/api-reference.md) | Endpoint documentation |
-| [Health Check Runbook](docs/health-check-runbook.md) | Troubleshooting, recovery, monitoring, and prevention procedures |
+| [Deployment Guide](docs/deployment.md) | Infrastructure setup and application deployment |
+| [API Reference](docs/api-reference.md) | Application endpoint documentation |
+| [Health Check Runbook](docs/health-check-runbook.md) | Troubleshooting, RCA, and recovery procedures |
+| [Disk Exhaustion Report](docs/disk-exhaustion-report.md) | Enterprise guide: detection, recovery, and prevention |
 
 ## Important Constraints
 

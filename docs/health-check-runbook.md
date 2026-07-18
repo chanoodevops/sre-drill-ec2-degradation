@@ -451,7 +451,7 @@ Example state:
 
 ```
 Filesystem      Size  Used Avail Use% Mounted on
-/dev/root       8.7G  8.6G   83M 100% /
+/dev/root        10G  9.9G   83M 100% /
 
 -rw-r----- 1 ubuntu ubuntu 8.2G Jul 17 14:12 application.log
 ```
@@ -647,7 +647,7 @@ Expected:
 
 ```
 Filesystem      Size  Used Avail Use% Mounted on
-/dev/root       8.7G  2.4G  6.3G  28% /
+/dev/root        10G  2.4G  7.6G  24% /
 ```
 
 ### Step 5: Check for Deleted-but-Open Files
@@ -1479,3 +1479,13 @@ Regularly test your recovery procedures:
 - [ ] Root cause documented
 - [ ] Long-term fix identified and scheduled
 - [ ] Post-mortem completed (if production incident)
+
+---
+
+## See Also
+
+| Document | Description |
+|----------|-------------|
+| [Deployment Guide](deployment.md) | Infrastructure setup and application deployment |
+| [API Reference](api-reference.md) | Application endpoint documentation |
+| [Disk Exhaustion Report](disk-exhaustion-report.md) | Enterprise guide: detection, recovery, and prevention |
