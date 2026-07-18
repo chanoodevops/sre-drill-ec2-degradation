@@ -769,6 +769,330 @@ pgrep -af uvicorn
 
 ---
 
+## Enterprise Prevention: Real-Time Log Shipping
+
+The best emergency recovery is the one you never need. In production, logs should be streamed off the instance in real-time so local disk never fills up.
+
+### Architecture Overview
+
+```
+EC2 Instance (local disk = temporary buffer only)
+    │
+    ├── Application writes to /var/log/storage-breaker/application.log
+    │
+    └── Log Shipper (Fluent Bit / CloudWatch Agent)
+            │
+            ├──→ CloudWatch Logs    (searchable, alerting, 90-day retention)
+            ├──→ S3 Bucket          (long-term, lifecycle policies)
+            └──→ Elasticsearch/Datadog/Splunk (if applicable)
+```
+
+### Option 1: Fluent Bit → CloudWatch Logs (AWS Native)
+
+**Fluent Bit** is a lightweight log shipper (uses ~450 KB memory). AWS provides a managed version.
+
+**Step 1: Install Fluent Bit**
+
+```bash
+# Add Fluent Bit repository
+curl https://packages.fluentbit.io/fluentbit.key | gpg --dearmor > \
+    /usr/share/keyrings/fluentbit-keyring.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/fluentbit-keyring.gpg] \
+    https://packages.fluentbit.io/ubuntu/jammy jammy main" | \
+    sudo tee /etc/apt/sources.list.d/fluentbit.list
+
+sudo apt update
+sudo apt install -y fluent-bit
+```
+
+**Step 2: Configure Fluent Bit**
+
+```bash
+sudo nano /etc/fluent-bit/fluent-bit.conf
+```
+
+```ini
+[SERVICE]
+    Flush        5
+    Log_Level    info
+    Daemon       off
+    Parsers_File parsers.conf
+
+[INPUT]
+    Name              tail
+    Path              /var/log/storage-breaker/application.log
+    Parser            json
+    Tag               storage-breaker
+    Refresh_Interval  5
+    Rotate_Wait       30
+    Mem_Buf_Limit     10MB
+
+[OUTPUT]
+    Name                cloudwatch_logs
+    Match               storage-breaker
+    region              us-east-1
+    log_group_name      /ec2/storage-breaker
+    log_stream_name     ${HOSTNAME}
+    auto_create_group   true
+    retry_Limit         5
+```
+
+**Step 3: Create parsers file**
+
+```bash
+sudo nano /etc/fluent-bit/parsers.conf
+```
+
+Add:
+
+```ini
+[PARSER]
+    Name        json
+    Format      json
+    Time_Key    timestamp
+    Time_Format %Y-%m-%dT%H:%M:%S%z
+```
+
+**Step 4: Enable and start**
+
+```bash
+sudo systemctl enable fluent-bit
+sudo systemctl start fluent-bit
+```
+
+**Step 5: Verify logs are shipping**
+
+```bash
+# Check Fluent Bit is running
+sudo systemctl status fluent-bit
+
+# Check CloudWatch Logs
+aws logs describe-log-streams \
+    --log-group-name /ec2/storage-breaker \
+    --order-by LastEventTime \
+    --descending \
+    --limit 1
+
+# Tail the log stream
+aws logs tail /ec2/storage-breaker --follow
+```
+
+**Step 6: Set CloudWatch log retention**
+
+```bash
+aws logs put-retention-policy \
+    --log-group-name /ec2/storage-breaker \
+    --retention-in-days 90
+```
+
+---
+
+### Option 2: CloudWatch Agent → CloudWatch Logs
+
+AWS's own agent. Heavier than Fluent Bit but integrates natively with CloudWatch metrics.
+
+**Step 1: Install CloudWatch Agent**
+
+```bash
+sudo apt install -y amazon-cloudwatch-agent
+```
+
+**Step 2: Create config**
+
+```bash
+sudo nano /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+```
+
+```json
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/storage-breaker/application.log",
+            "log_group_name": "/ec2/storage-breaker",
+            "log_stream_name": "{instance_id}",
+            "timezone": "UTC"
+          }
+        ]
+      }
+    },
+    "log_stream_name": "storage-breaker-stream"
+  },
+  "metrics": {
+    "namespace": "StorageBreaker",
+    "metrics_collected": {
+      "disk": {
+        "measurement": ["used_percent"],
+        "resources": ["/"]
+      }
+    }
+  }
+}
+```
+
+**Step 3: Start the agent**
+
+```bash
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a fetch-config \
+    -m ec2 \
+    -s \
+    -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+```
+
+**Step 4: Verify**
+
+```bash
+# Check agent status
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a status
+
+# Check logs in CloudWatch
+aws logs tail /ec2/storage-breaker --follow
+```
+
+---
+
+### Option 3: Fluent Bit → S3 (Direct to S3)
+
+When you want logs in S3 without CloudWatch Logs as an intermediary.
+
+**Step 1: Create S3 bucket with lifecycle**
+
+```bash
+# Create bucket
+aws s3 mb s3://my-app-logs-$(aws sts get-caller-identity --query Account --output text)
+
+# Set lifecycle policy (auto-delete after 365 days, transition to IA after 30 days)
+aws s3api put-bucket-lifecycle-configuration \
+    --bucket my-app-logs-ACCOUNT-ID \
+    --lifecycle-configuration '{
+        "Rules": [{
+            "ID": "LogRetention",
+            "Status": "Enabled",
+            "Filter": {"Prefix": "storage-breaker/"},
+            "Transitions": [
+                {"Days": 30, "StorageClass": "STANDARD_IA"},
+                {"Days": 90, "StorageClass": "GLACIER"}
+            ],
+            "Expiration": {"Days": 365}
+        }]
+    }'
+```
+
+**Step 2: Configure Fluent Bit for S3**
+
+```ini
+[OUTPUT]
+    Name            s3
+    Match           storage-breaker
+    region          us-east-1
+    bucket          my-app-logs-ACCOUNT-ID
+    s3_key_format   /storage-breaker/$TAG/%Y/%m/%d/$UUID.json
+    total_file_size 50M
+    upload_timeout  5m
+    use_put         true
+    compression     gzip
+```
+
+---
+
+### Option 4: Filebeat → ELK Stack
+
+When using Elasticsearch, Logstash, Kibana.
+
+**Step 1: Install Filebeat**
+
+```bash
+curl -L -O https://artifacts.elastic.co/downloads/beats/filebeat/filebeat-8.14.0-amd64.deb
+sudo dpkg -i filebeat-8.14.0-amd64.deb
+```
+
+**Step 2: Configure Filebeat**
+
+```bash
+sudo nano /etc/filebeat/filebeat.yml
+```
+
+```yaml
+filebeat.inputs:
+  - type: log
+    paths:
+      - /var/log/storage-breaker/application.log
+    json.keys_under_root: true
+    json.add_error_key: true
+
+output.elasticsearch:
+  hosts: ["ELASTICSEARCH_HOST:9200"]
+  index: "storage-breaker-%{+yyyy.MM.dd}"
+
+setup.template.name: "storage-breaker"
+setup.template.pattern: "storage-breaker-*"
+setup.ilm.enabled: false
+```
+
+**Step 3: Enable and start**
+
+```bash
+sudo systemctl enable filebeat
+sudo systemctl start filebeat
+```
+
+---
+
+### Log Shipping Comparison
+
+| Solution | Memory | Complexity | Best For |
+|----------|--------|------------|----------|
+| **Fluent Bit → CloudWatch** | ~450 KB | Low | AWS-native, lightweight |
+| **CloudWatch Agent** | ~60 MB | Medium | AWS-native, need metrics too |
+| **Fluent Bit → S3** | ~450 KB | Medium | Direct to S3, no CloudWatch |
+| **Filebeat → ELK** | ~100 MB | High | Already running ELK stack |
+| **rsync cron** | Negligible | Very Low | Simple, low-volume logging |
+
+---
+
+### With Log Shipping: Disk Never Fills
+
+```
+Normal flow:
+    App writes → local log file → Fluent Bit tails → ships to S3/CloudWatch
+                                         │
+                              Local file can be rotated/truncated
+                              because data is already shipped
+
+If disk fills anyway:
+    1. Stop app
+    2. Truncate local log (data is safe in S3/CloudWatch)
+    3. Restart app
+    4. No data loss
+```
+
+---
+
+### Combining With Other Fixes
+
+| Fix | Without Log Shipping | With Log Shipping |
+|-----|---------------------|-------------------|
+| **Dedicated EBS** | Still needed to isolate logs | Nice to have, not critical |
+| **Log rotation** | Required to cap local size | Can use aggressive rotation (rotate daily) |
+| **Disk threshold** | Essential safety net | Safety net, but less likely to trigger |
+| **S3 copy (Option C)** | Manual emergency step | Automatic — logs go to S3 in real-time |
+
+**Recommended production stack:**
+
+```
+Fluent Bit → CloudWatch Logs (alerting + search)
+           → S3 (long-term retention)
+           + logrotate (cap local size at 100MB)
+           + dedicated EBS volume (isolate from root)
+```
+
+---
+
 ## Long-Term Resolution (Permanent Fixes)
 
 These changes prevent the failure from recurring. Implement one or more based on your operational requirements.
