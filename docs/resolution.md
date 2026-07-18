@@ -532,19 +532,183 @@ Filesystem      Size  Used Avail Use% Mounted on
 
 ### Step 3: Free Disk Space
 
-**Option A — Truncate (preferred when file is open or permissions must be preserved):**
+Choose the appropriate option based on whether you need to preserve the log data.
+
+---
+
+**Option A — Truncate (logs are not important, fastest recovery):**
 
 ```bash
 sudo truncate -s 0 /var/log/storage-breaker/application.log
 ```
 
-**Option B — Delete and recreate (use when application is stopped):**
+**Option B — Delete and recreate (application is stopped, logs not needed):**
 
 ```bash
 sudo rm -f /var/log/storage-breaker/application.log
 sudo touch /var/log/storage-breaker/application.log
 sudo chown ubuntu:ubuntu /var/log/storage-breaker/application.log
 sudo chmod 640 /var/log/storage-breaker/application.log
+```
+
+---
+
+**Option C — Preserve logs: Copy to S3 before truncating (recommended for important logs):**
+
+Use when logs contain audit data, compliance records, or debugging information you need later.
+
+```bash
+# 1. Stop the application
+sudo systemctl stop storage-breaker
+
+# 2. Install AWS CLI if not present
+sudo apt install -y awscli
+
+# 3. Upload the log to S3
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+aws s3 cp /var/log/storage-breaker/application.log \
+    s3://YOUR-BACKUP-BUCKET/storage-breaker/${TIMESTAMP}/application.log
+
+# 4. Verify upload completed
+aws s3 ls s3://YOUR-BACKUP-BUCKET/storage-breaker/${TIMESTAMP}/
+
+# 5. Truncate the local log
+sudo truncate -s 0 /var/log/storage-breaker/application.log
+
+# 6. Restart the service
+sudo systemctl start storage-breaker
+```
+
+---
+
+**Option D — Preserve logs: Compress in place (no S3, fastest local option):**
+
+```bash
+# 1. Stop the application
+sudo systemctl stop storage-breaker
+
+# 2. Compress the log file
+sudo gzip -9 /var/log/storage-breaker/application.log
+# Creates: application.log.gz
+
+# 3. Check space freed
+df -h /
+
+# 4. Create a fresh empty log file
+sudo touch /var/log/storage-breaker/application.log
+sudo chown ubuntu:ubuntu /var/log/storage-breaker/application.log
+sudo chmod 640 /var/log/storage-breaker/application.log
+
+# 5. Restart
+sudo systemctl start storage-breaker
+```
+
+Example result:
+
+```
+/var/log/storage-breaker/
+├── application.log        (0 bytes — new, active log)
+└── application.log.gz     (compressed — old log preserved)
+```
+
+Compression ratio for JSON logs is typically **80-90%**. An 8 GB log file may compress to ~800 MB.
+
+---
+
+**Option E — Preserve logs: Move to a different volume (quick EBS attach):**
+
+Use when you need to preserve logs AND free root disk space simultaneously, and the log is too large for S3 upload or compression.
+
+```bash
+# 1. Attach a new EBS volume (done via AWS Console)
+#    Note the device name, e.g., /dev/nvme1n1
+
+# 2. Stop the application
+sudo systemctl stop storage-breaker
+
+# 3. Format if new (skip if already formatted)
+sudo mkfs.ext4 /dev/nvme1n1
+
+# 4. Mount temporarily
+sudo mkdir -p /mnt/log-rescue
+sudo mount /dev/nvme1n1 /mnt/log-rescue
+
+# 5. Move the log to the new volume
+sudo mv /var/log/storage-breaker/application.log \
+    /mnt/log-rescue/application.log
+
+# 6. Create fresh log file
+sudo touch /var/log/storage-breaker/application.log
+sudo chown ubuntu:ubuntu /var/log/storage-breaker/application.log
+sudo chmod 640 /var/log/storage-breaker/application.log
+
+# 7. Restart service
+sudo systemctl start storage-breaker
+
+# 8. Verify
+df -h /
+df -h /mnt/log-rescue
+
+# 9. Upload to S3 later when disk pressure is gone
+aws s3 cp /mnt/log-rescue/application.log \
+    s3://YOUR-BACKUP-Bucket/storage-breaker/
+
+# 10. Unmount and detach the rescue volume
+sudo umount /mnt/log-rescue
+# Then detach via AWS Console
+```
+
+---
+
+**Option F — Preserve logs: Stream to remote via `rsync` (if SSH to another host is available):**
+
+```bash
+# 1. Stop the application
+sudo systemctl stop storage-breaker
+
+# 2. Copy log to remote server
+rsync -avz /var/log/storage-breaker/application.log \
+    backup-user@REMOTE_HOST:/backups/storage-breaker/
+
+# 3. Truncate local log
+sudo truncate -s 0 /var/log/storage-breaker/application.log
+
+# 4. Restart
+sudo systemctl start storage-breaker
+```
+
+---
+
+### When to Use Each Option
+
+| Scenario | Option | Why |
+| -------- | ------ | --- |
+| Logs not needed, speed is priority | **A** or **B** | Fastest recovery |
+| Logs important, S3 available | **C** | Durable, versioned, cheap storage |
+| Logs important, no S3, fast fix | **D** | Compression is instant, no network |
+| Logs very large, need full copy | **E** | Move off the root volume entirely |
+| Another server available | **F** | Simple network copy |
+
+### Decision Flowchart
+
+```
+Are the logs important?
+    │
+    ├── NO → Option A (truncate) or B (delete)
+    │
+    └── YES → Is S3 available?
+                │
+                ├── YES → Option C (copy to S3, then truncate)
+                │
+                └── NO → Can you compress?
+                            │
+                            ├── YES → Option D (gzip in place)
+                            │
+                            └── NO → Another host available?
+                                        │
+                                        ├── YES → Option F (rsync)
+                                        │
+                                        └── NO → Option E (attach rescue EBS)
 ```
 
 ### Step 4: Verify Space Recovered
