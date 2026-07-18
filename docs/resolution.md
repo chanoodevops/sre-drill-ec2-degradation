@@ -12,6 +12,292 @@
 
 ---
 
+## Real-World Detection: How Do We Know?
+
+In production, you don't wait for a `curl` to tell you the disk is full. Here's how SREs detect disk exhaustion before it becomes an outage.
+
+### 1. CloudWatch Metrics (AWS Native)
+
+AWS automatically publishes EBS volume metrics to CloudWatch every 5 minutes.
+
+**Key metrics to monitor:**
+
+| Metric | Namespace | Description |
+| ------ | --------- | ----------- |
+| `DiskSpaceUtilization` | `CWAgent` | Percentage of disk used (requires CloudWatch agent) |
+| `VolumeReadOps` | `AWS/EBS` | Read operations per second |
+| `VolumeWriteOps` | `AWS/EBS` | Write operations per second |
+| `BurstBalance` | `AWS/EBS` | gp2/gp3 burst credit balance |
+
+**Install CloudWatch agent for disk metrics:**
+
+```bash
+# Download and install
+sudo apt install -y amazon-cloudwatch-agent
+
+# Create config
+sudo nano /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+```
+
+```json
+{
+  "metrics": {
+    "namespace": "StorageBreaker",
+    "metrics_collected": {
+      "disk": {
+        "measurement": ["used_percent", "inodes_free"],
+        "resources": ["/"]
+      }
+    }
+  }
+}
+```
+
+```bash
+# Start the agent
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a fetch-config \
+    -m ec2 \
+    -s \
+    -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+```
+
+**Create CloudWatch Alarm:**
+
+```bash
+aws cloudwatch put-metric-alarm \
+    --alarm-name "DiskCritical-RootVolume" \
+    --alarm-description "Root volume disk usage >= 85%" \
+    --metric-name DiskSpaceUtilization \
+    --namespace StorageBreaker \
+    --statistic Average \
+    --period 300 \
+    --threshold 85 \
+    --comparison-operator GreaterThanOrEqualToThreshold \
+    --evaluation-periods 1 \
+    --alarm-actions arn:aws:sns:us-east-1:ACCOUNT-ID:disk-alerts \
+    --dimensions Name=InstanceId,Value=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+```
+
+---
+
+### 2. Prometheus + Grafana (Open Source)
+
+**Node Exporter** exposes disk metrics as Prometheus scrape targets.
+
+```bash
+# Install Node Exporter
+wget https://github.com/prometheus/node_exporter/releases/download/v1.7.0/node_exporter-1.7.0.linux-amd64.tar.gz
+tar xzf node_exporter-1.7.0.linux-amd64.tar.gz
+sudo cp node_exporter-1.7.0.linux-amd64/node_exporter /usr/local/bin/
+
+# Create systemd service
+sudo nano /etc/systemd/system/node_exporter.service
+```
+
+```ini
+[Unit]
+Description=Prometheus Node Exporter
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now node_exporter
+```
+
+**Key Prometheus queries:**
+
+```promql
+# Disk usage percentage
+(1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100
+
+# Disk usage rate (how fast it's filling)
+deriv(node_filesystem_avail_bytes{mountpoint="/"}[1h]) * -1
+
+# Time until full (hours remaining)
+node_filesystem_avail_bytes{mountpoint="/"} / (deriv(node_filesystem_avail_bytes{mountpoint="/"}[1h]) * -1) / 3600
+```
+
+---
+
+### 3. Syslog + Log-Based Alerts
+
+Forward system logs to a centralized platform and alert on disk-related messages.
+
+**Syslog messages to watch:**
+
+```bash
+# "No space left on device" errors
+grep -i "no space left" /var/log/syslog
+
+# Filesystem full warnings
+grep -i "filesystem full" /var/log/kern.log
+
+# Out-of-memory or journal failures
+journalctl -p err --since "1 hour ago"
+```
+
+**ELK / Loki alert rules:**
+
+```yaml
+# Grafana Loki alert rule
+- alert: DiskExhaustion
+  expr: |
+    sum by (instance) (rate({job="node"} |~ "No space left on device"[5m])) > 0
+  for: 2m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Disk exhaustion detected on {{ $labels.instance }}"
+```
+
+---
+
+### 4. Health Check Monitoring (External)
+
+External uptime monitors detect when your health endpoint starts returning 503.
+
+| Tool | How It Works |
+| ---- | ------------ |
+| **AWS CloudWatch Synthetics** | Canary scripts hit `/health` every 1 minute |
+| **Pingdom / UptimeRobot** | HTTP checks from external locations |
+| **Grafana OnCall** | Integrated alerting with escalation |
+| **PagerDuty** | Incident management with on-call routing |
+
+**CloudWatch Synthetics canary:**
+
+```javascript
+// canary.js
+const https = require("https");
+
+exports.handler = async () => {
+    const url = "http://EC2_PUBLIC_IP/health";
+    return new Promise((resolve, reject) => {
+        https.get(url, (res) => {
+            if (res.statusCode !== 200) {
+                reject(new Error(`Health check returned ${res.statusCode}`));
+            } else {
+                resolve("OK");
+            }
+        }).on("error", reject);
+    });
+};
+```
+
+---
+
+### 5. System-Level Detection (On-Instance)
+
+**Cron-based disk monitoring script:**
+
+```bash
+#!/bin/bash
+# /usr/local/bin/disk-monitor.sh
+
+ALERT_THRESHOLD=80
+CRITICAL_THRESHOLD=90
+LOG_FILE="/var/log/disk-monitor.log"
+
+USAGE=$(df / --output=pcent | tail -1 | tr -d ' %')
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+if [ "$USAGE" -ge "$CRITICAL_THRESHOLD" ]; then
+    echo "[$TIMESTAMP] CRITICAL: Root filesystem at ${USAGE}%" >> "$LOG_FILE"
+    # Send SNS notification
+    aws sns publish \
+        --topic-arn "arn:aws:sns:us-east-1:ACCOUNT:disk-alerts" \
+        --message "CRITICAL: Disk usage at ${USAGE}% on $(hostname)" \
+        --subject "Disk Critical"
+elif [ "$USAGE" -ge "$ALERT_THRESHOLD" ]; then
+    echo "[$TIMESTAMP] WARNING: Root filesystem at ${USAGE}%" >> "$LOG_FILE"
+fi
+```
+
+```bash
+# Add to crontab
+echo "*/5 * * * * /usr/local/bin/disk-monitor.sh" | crontab -
+```
+
+**Systemd timer (modern alternative to cron):**
+
+```ini
+# /etc/systemd/system/disk-monitor.service
+[Unit]
+Description=Disk usage monitor
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/disk-monitor.sh
+```
+
+```ini
+# /etc/systemd/system/disk-monitor.timer
+[Unit]
+Description=Run disk monitor every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+```
+
+---
+
+### 6. CloudWatch Agent + SNS Integration (End-to-End)
+
+This is the most common production setup:
+
+```
+EC2 Instance
+    │
+    ├── CloudWatch Agent → publishes DiskSpaceUtilization metric
+    │
+    └── CloudWatch Alarm → triggers when usage >= 85%
+            │
+            └── SNS Topic → sends email / SMS / Slack
+                    │
+                    └── Lambda → auto-remediate (truncate logs, page on-call)
+```
+
+---
+
+### Detection Method Comparison
+
+| Method | Detection Speed | Setup Effort | Cost | Best For |
+| ------ | --------------- | ------------ | ---- | -------- |
+| `df -h` (manual) | Minutes | None | Free | Drills, small environments |
+| CloudWatch Agent | 5 min intervals | Medium | Low | AWS-native setups |
+| Prometheus + Grafana | 15s–1min | Medium | Free | Multi-cloud, Kubernetes |
+| Syslog + ELK/Loki | Near real-time | High | Medium | Centralized log analysis |
+| Health check monitor | 1 min intervals | Low | Free/Low | External availability |
+| Cron script | 5 min intervals | Low | Free | Quick on-instance setup |
+
+### Signal Cascade: What Happens as Disk Fills
+
+```
+Disk Usage    System Behavior                          Detection Signal
+──────────    ─────────────────────────────────────    ──────────────────────
+70-80%        Normal operation                         CloudWatch warning
+80-85%        Logs may slow down                       CloudWatch alarm fires
+85-90%        Nginx temp files may fail                Application errors
+90-95%        Health check returns 503                 Uptime monitor alerts
+95-100%       SSH may fail, OS unstable                PagerDuty escalation
+100%          System hang, potential data loss         All alerts firing
+```
+
+---
+
 ## Temporary Resolution (Emergency Recovery)
 
 Use this when the root filesystem is already at or near 100%. The goal is to restore service as quickly as possible.
