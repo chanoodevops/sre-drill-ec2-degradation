@@ -152,5 +152,3 @@ Submit the following:
 
 - [Deployment Guide](docs/deployment.md)
 - [API Reference](docs/api-reference.md)
-- [Monitoring Guide](docs/monitoring.md)
-- [Troubleshooting Guide](docs/troubleshooting.md)

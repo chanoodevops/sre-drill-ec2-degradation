@@ -133,8 +133,7 @@ The `/health` endpoint returns:
 | -------- | ----------- |
 | [Deployment Guide](docs/deployment.md) | Full deployment instructions |
 | [API Reference](docs/api-reference.md) | Endpoint documentation |
-| [Monitoring Guide](docs/monitoring.md) | Observability and health checks |
-| [Troubleshooting Guide](docs/troubleshooting.md) | Recovery procedures |
+| [Health Check Runbook](docs/health-check-runbook.md) | Troubleshooting, recovery, monitoring, and prevention procedures |
 
 ## Important Constraints
 

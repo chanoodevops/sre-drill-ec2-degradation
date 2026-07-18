@@ -1,306 +1,53 @@
-# Resolution Guide: EC2 Disk Exhaustion Failure
+# Runbook: Health Check Failure RCA & Recovery
 
 ## Failure Summary
 
 | Field | Detail |
 | ----- | ------ |
 | **Incident** | Health check returns `503 Service Unavailable` |
-| **Root Cause** | Disk exhaustion on `/dev/root` — application log file consumed all available space |
-| **Impact** | Application unhealthy, Nginx returning 503, risk of OS instability |
+| **Common Root Causes** | Disk exhaustion, memory exhaustion, service crash, port conflict, Nginx misconfiguration, load balancer issues |
+| **Impact** | Application unhealthy, users receive 503 errors |
 | **Severity** | High — service degraded, potential cascade to SSH/Nginx/systemd failures |
-| **Affected Component** | `/var/log/storage-breaker/application.log` on root EBS volume |
+| **Affected Component** | Storage Breaker application on EC2 instance |
 
 ---
 
-## Real-World Detection: How Do We Know?
+## Quick Reference
 
-In production, you don't wait for a `curl` to tell you the disk is full. Here's how SREs detect disk exhaustion before it becomes an outage.
+### Troubleshooting Commands
 
-### 1. CloudWatch Metrics (AWS Native)
+| Command | What it tells you |
+|---------|-------------------|
+| `df -h /` | Is disk full? |
+| `df -ih` | Are inodes exhausted? |
+| `free -h` | Is memory the issue? |
+| `uptime` | Is the system overloaded? |
+| `sudo du -xhd1 / \| sort -rh \| head -10` | What directory is largest? |
+| `sudo ls -lh /var/log/storage-breaker/` | How big is the log file? |
+| `pgrep -af uvicorn` | Is the app running? How many workers? |
+| `sudo systemctl status storage-breaker` | Service state |
+| `sudo journalctl -u storage-breaker -n 50` | Recent service logs |
+| `sudo lsof +L1` | Deleted files still open |
+| `sudo ss -lntp \| grep -E ':80\|:3000'` | Are ports listening? |
+| `curl -i http://127.0.0.1:3000/health` | Health check from inside |
 
-AWS automatically publishes EBS volume metrics to CloudWatch every 5 minutes.
+### 503 Causes
 
-**Key metrics to monitor:**
-
-| Metric | Namespace | Description |
-| ------ | --------- | ----------- |
-| `DiskSpaceUtilization` | `CWAgent` | Percentage of disk used (requires CloudWatch agent) |
-| `VolumeReadOps` | `AWS/EBS` | Read operations per second |
-| `VolumeWriteOps` | `AWS/EBS` | Write operations per second |
-| `BurstBalance` | `AWS/EBS` | gp2/gp3 burst credit balance |
-
-**Install CloudWatch agent for disk metrics:**
-
-```bash
-# Download and install
-sudo apt install -y amazon-cloudwatch-agent
-
-# Create config
-sudo nano /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
-```
-
-```json
-{
-  "metrics": {
-    "namespace": "StorageBreaker",
-    "metrics_collected": {
-      "disk": {
-        "measurement": ["used_percent", "inodes_free"],
-        "resources": ["/"]
-      }
-    }
-  }
-}
-```
-
-```bash
-# Start the agent
-sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-    -a fetch-config \
-    -m ec2 \
-    -s \
-    -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
-```
-
-**Create CloudWatch Alarm:**
-
-```bash
-aws cloudwatch put-metric-alarm \
-    --alarm-name "DiskCritical-RootVolume" \
-    --alarm-description "Root volume disk usage >= 85%" \
-    --metric-name DiskSpaceUtilization \
-    --namespace StorageBreaker \
-    --statistic Average \
-    --period 300 \
-    --threshold 85 \
-    --comparison-operator GreaterThanOrEqualToThreshold \
-    --evaluation-periods 1 \
-    --alarm-actions arn:aws:sns:us-east-1:ACCOUNT-ID:disk-alerts \
-    --dimensions Name=InstanceId,Value=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-```
+| Cause | Check | Fix |
+|-------|-------|-----|
+| Disk full | `df -h /` | Truncate logs, add rotation |
+| Memory exhausted | `free -h`, `dmesg \| grep oom` | Increase instance size, fix leak |
+| Service crashed | `systemctl status`, `journalctl -u` | Restart, fix crash cause |
+| Port conflict | `ss -lntp \| grep :3000` | Kill conflicting process |
+| App bug | `curl localhost:3000/health` | Check app logs, fix code |
+| Nginx misconfigured | `nginx -t`, `curl localhost/health` | Fix Nginx config, restart |
+| Target group unhealthy | `aws elbv2 describe-target-health` | Fix instance health |
 
 ---
 
-### 2. Prometheus + Grafana (Open Source)
+## Troubleshooting & Root Cause Analysis
 
-**Node Exporter** exposes disk metrics as Prometheus scrape targets.
-
-```bash
-# Install Node Exporter
-wget https://github.com/prometheus/node_exporter/releases/download/v1.7.0/node_exporter-1.7.0.linux-amd64.tar.gz
-tar xzf node_exporter-1.7.0.linux-amd64.tar.gz
-sudo cp node_exporter-1.7.0.linux-amd64/node_exporter /usr/local/bin/
-
-# Create systemd service
-sudo nano /etc/systemd/system/node_exporter.service
-```
-
-```ini
-[Unit]
-Description=Prometheus Node Exporter
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/node_exporter
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now node_exporter
-```
-
-**Key Prometheus queries:**
-
-```promql
-# Disk usage percentage
-(1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100
-
-# Disk usage rate (how fast it's filling)
-deriv(node_filesystem_avail_bytes{mountpoint="/"}[1h]) * -1
-
-# Time until full (hours remaining)
-node_filesystem_avail_bytes{mountpoint="/"} / (deriv(node_filesystem_avail_bytes{mountpoint="/"}[1h]) * -1) / 3600
-```
-
----
-
-### 3. Syslog + Log-Based Alerts
-
-Forward system logs to a centralized platform and alert on disk-related messages.
-
-**Syslog messages to watch:**
-
-```bash
-# "No space left on device" errors
-grep -i "no space left" /var/log/syslog
-
-# Filesystem full warnings
-grep -i "filesystem full" /var/log/kern.log
-
-# Out-of-memory or journal failures
-journalctl -p err --since "1 hour ago"
-```
-
-**ELK / Loki alert rules:**
-
-```yaml
-# Grafana Loki alert rule
-- alert: DiskExhaustion
-  expr: |
-    sum by (instance) (rate({job="node"} |~ "No space left on device"[5m])) > 0
-  for: 2m
-  labels:
-    severity: critical
-  annotations:
-    summary: "Disk exhaustion detected on {{ $labels.instance }}"
-```
-
----
-
-### 4. Health Check Monitoring (External)
-
-External uptime monitors detect when your health endpoint starts returning 503.
-
-| Tool | How It Works |
-| ---- | ------------ |
-| **AWS CloudWatch Synthetics** | Canary scripts hit `/health` every 1 minute |
-| **Pingdom / UptimeRobot** | HTTP checks from external locations |
-| **Grafana OnCall** | Integrated alerting with escalation |
-| **PagerDuty** | Incident management with on-call routing |
-
-**CloudWatch Synthetics canary:**
-
-```javascript
-// canary.js
-const https = require("https");
-
-exports.handler = async () => {
-    const url = "http://EC2_PUBLIC_IP/health";
-    return new Promise((resolve, reject) => {
-        https.get(url, (res) => {
-            if (res.statusCode !== 200) {
-                reject(new Error(`Health check returned ${res.statusCode}`));
-            } else {
-                resolve("OK");
-            }
-        }).on("error", reject);
-    });
-};
-```
-
----
-
-### 5. System-Level Detection (On-Instance)
-
-**Cron-based disk monitoring script:**
-
-```bash
-#!/bin/bash
-# /usr/local/bin/disk-monitor.sh
-
-ALERT_THRESHOLD=80
-CRITICAL_THRESHOLD=90
-LOG_FILE="/var/log/disk-monitor.log"
-
-USAGE=$(df / --output=pcent | tail -1 | tr -d ' %')
-TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-if [ "$USAGE" -ge "$CRITICAL_THRESHOLD" ]; then
-    echo "[$TIMESTAMP] CRITICAL: Root filesystem at ${USAGE}%" >> "$LOG_FILE"
-    # Send SNS notification
-    aws sns publish \
-        --topic-arn "arn:aws:sns:us-east-1:ACCOUNT:disk-alerts" \
-        --message "CRITICAL: Disk usage at ${USAGE}% on $(hostname)" \
-        --subject "Disk Critical"
-elif [ "$USAGE" -ge "$ALERT_THRESHOLD" ]; then
-    echo "[$TIMESTAMP] WARNING: Root filesystem at ${USAGE}%" >> "$LOG_FILE"
-fi
-```
-
-```bash
-# Add to crontab
-echo "*/5 * * * * /usr/local/bin/disk-monitor.sh" | crontab -
-```
-
-**Systemd timer (modern alternative to cron):**
-
-```ini
-# /etc/systemd/system/disk-monitor.service
-[Unit]
-Description=Disk usage monitor
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/disk-monitor.sh
-```
-
-```ini
-# /etc/systemd/system/disk-monitor.timer
-[Unit]
-Description=Run disk monitor every 5 minutes
-
-[Timer]
-OnBootSec=5min
-OnUnitActiveSec=5min
-
-[Install]
-WantedBy=timers.target
-```
-
----
-
-### 6. CloudWatch Agent + SNS Integration (End-to-End)
-
-This is the most common production setup:
-
-```
-EC2 Instance
-    │
-    ├── CloudWatch Agent → publishes DiskSpaceUtilization metric
-    │
-    └── CloudWatch Alarm → triggers when usage >= 85%
-            │
-            └── SNS Topic → sends email / SMS / Slack
-                    │
-                    └── Lambda → auto-remediate (truncate logs, page on-call)
-```
-
----
-
-### Detection Method Comparison
-
-| Method | Detection Speed | Setup Effort | Cost | Best For |
-| ------ | --------------- | ------------ | ---- | -------- |
-| `df -h` (manual) | Minutes | None | Free | Drills, small environments |
-| CloudWatch Agent | 5 min intervals | Medium | Low | AWS-native setups |
-| Prometheus + Grafana | 15s–1min | Medium | Free | Multi-cloud, Kubernetes |
-| Syslog + ELK/Loki | Near real-time | High | Medium | Centralized log analysis |
-| Health check monitor | 1 min intervals | Low | Free/Low | External availability |
-| Cron script | 5 min intervals | Low | Free | Quick on-instance setup |
-
-### Signal Cascade: What Happens as Disk Fills
-
-```
-Disk Usage    System Behavior                          Detection Signal
-──────────    ─────────────────────────────────────    ──────────────────────
-70-80%        Normal operation                         CloudWatch warning
-80-85%        Logs may slow down                       CloudWatch alarm fires
-85-90%        Nginx temp files may fail                Application errors
-90-95%        Health check returns 503                 Uptime monitor alerts
-95-100%       SSH may fail, OS unstable                PagerDuty escalation
-100%          System hang, potential data loss         All alerts firing
-```
-
----
-
-## No Monitoring? Troubleshooting From Scratch
-
-In many real-world scenarios, you get paged for a 503 and there's no dashboard, no alerts, no history. You're flying blind. Here's the systematic approach.
+This section covers how to identify the problem, whether you have monitoring in place or not.
 
 ### Phase 1: First 60 Seconds — Confirm the Problem
 
@@ -325,6 +72,37 @@ sudo systemctl status storage-breaker
 - SSH works → OS is not fully hung
 - 503 from health check → application sees a problem
 - Service status → whether it's running or crashed
+
+---
+
+### SSH Connection Fails
+
+If SSH times out or refuses the connection, the issue is at the OS or network level, not the application.
+
+**Symptoms:**
+
+```bash
+ssh ubuntu@EC2_PUBLIC_IP
+# Connection timed out
+# or
+# ssh: connect to host EC2_PUBLIC_IP port 22: Connection refused
+```
+
+**Diagnosis:**
+
+1. Verify the instance is running in AWS Console (`EC2 → Instances`)
+2. Check Security Group allows port 22 from your IP:
+   ```bash
+   # In AWS CLI
+   aws ec2 describe-security-groups --group-ids sg-XXXXXXXX
+   ```
+3. Verify you're using the correct PEM key:
+   ```bash
+   ssh -i <correct-key>.pem ubuntu@EC2_PUBLIC_IP
+   ```
+4. If the instance is running but SSH fails, the OS may be hung due to disk exhaustion or OOM — check the instance's system log in AWS Console (`EC2 → Actions → Monitor and troubleshoot → Get system log`)
+
+**Resolution:** If the OS is hung, you may need to stop/start the instance or use AWS Systems Manager Session Manager to access it.
 
 ---
 
@@ -359,51 +137,9 @@ pgrep -af uvicorn
 
 ### Phase 3: Deep Dive — Confirm Root Cause
 
-If disk is the problem, investigate further:
-
-```bash
-# What's using the disk?
-sudo du -xhd1 / 2>/dev/null | sort -rh | head -10
-```
-
-Example output:
-```
-8.2G    /var
-2.4G    /usr
-1.1G    /opt
-```
-
-→ `/var` is the problem. Drill down:
-
-```bash
-sudo du -sh /var/*
-```
-
-```
-8.0G    /var/log
-```
-
-→ `/var/log` is the problem. Drill down:
-
-```bash
-sudo du -sh /var/log/*
-```
-
-```
-7.8G    /var/log/storage-breaker
-```
-
-→ Found it. Check the file:
-
-```bash
-sudo ls -lh /var/log/storage-breaker/application.log
-```
-
-```
--rw-r----- 1 ubuntu ubuntu 7.8G Jul 17 14:12 application.log
-```
-
-**Root cause confirmed: Application log file consumed 7.8 GB of an 8.7 GB root volume.**
+If disk is the problem, proceed to **Step A: Disk Exhaustion RCA** for detailed investigation.
+If memory is the problem, proceed to **Step B: Memory Exhaustion RCA**.
+For other failure categories, see the **Failure Classification** table and follow the corresponding step.
 
 ---
 
@@ -437,29 +173,219 @@ Is the service still running?
     │
     └── NO → Check why it stopped
               sudo journalctl -u storage-breaker -n 50
-              (may show "No space left on device" errors)
+              (look for error messages)
 
-Then → Free disk space → Restart → Verify
+Then → Apply the appropriate fix → Restart → Verify
 ```
 
 ---
 
-### Quick Reference: Troubleshooting Commands
+### Failure Category Classification
 
-| Command | What it tells you |
-|---------|-------------------|
-| `df -h /` | Is disk full? |
-| `df -ih` | Are inodes exhausted? |
-| `free -h` | Is memory the issue? |
-| `uptime` | Is the system overloaded? |
-| `sudo du -xhd1 / \| sort -rh \| head -10` | What directory is largest? |
-| `sudo ls -lh /var/log/storage-breaker/` | How big is the log file? |
-| `pgrep -af uvicorn` | Is the app running? How many workers? |
-| `sudo systemctl status storage-breaker` | Service state |
-| `sudo journalctl -u storage-breaker -n 50` | Recent service logs |
-| `sudo lsof +L1` | Deleted files still open |
-| `sudo ss -lntp \| grep -E ':80\|:3000'` | Are ports listening? |
-| `curl -i http://127.0.0.1:3000/health` | Health check from inside |
+When the health check returns 503, classify the failure before attempting fixes.
+
+| Symptom | Category | Next Step |
+|---------|----------|-----------|
+| `df -h` shows ≥ 95% disk | **Disk Exhaustion** | → Step A |
+| `free -h` shows no available memory, OOM in logs | **Memory Exhaustion** | → Step B |
+| `pgrep uvicorn` returns nothing | **Service Not Running** | → Step C |
+| `ss -lntp` shows port 3000 not listening | **Port Not Bound** | → Step D |
+| Port 3000 listening, but `curl localhost:3000` fails | **Application Error** | → Step E |
+| Port 3000 works, but external curl fails | **Network/Nginx Issue** | → Step F |
+| Health endpoint returns 200 but load balancer shows 503 | **Load Balancer/Target Group** | → Step G |
+
+---
+
+### Step A: Disk Exhaustion RCA
+
+```bash
+# How full is the disk?
+df -h /
+
+# What's consuming space? Drill down from root
+sudo du -xhd1 / 2>/dev/null | sort -rh | head -10
+# Example: /var is 8GB → drill into /var
+
+sudo du -sh /var/*
+# Example: /var/log is 7.8GB → drill into /var/log
+
+sudo du -sh /var/log/*
+# Example: /var/log/storage-breaker is 7.6GB → found it
+
+# Check the specific file
+sudo ls -lh /var/log/storage-breaker/application.log
+# Example: -rw-r----- 1 ubuntu ubuntu 7.6G Jul 17 14:12 application.log
+
+# Check if inodes are also exhausted
+df -ih
+```
+
+**Root cause confirmed:** Application log file grew until disk was 100% full.
+
+**Evidence to document:**
+- `df -h` output showing 100%
+- `du` drill-down showing the culprit file
+- File size and growth rate
+
+---
+
+### Step B: Memory Exhaustion RCA
+
+```bash
+# Check memory usage
+free -h
+
+# Check for OOM kills
+sudo journalctl -k | grep -i "out of memory"
+dmesg | grep -i "oom"
+
+# Check which process used the most memory
+ps aux --sort=-%mem | head -10
+
+# Check swap usage
+swapon --show
+```
+
+**Root cause candidates:**
+- Memory leak in application
+- Too many workers/processes
+- Insufficient instance size for workload
+
+---
+
+### Step C: Service Not Running RCA
+
+```bash
+# Why did the service stop?
+sudo journalctl -u storage-breaker -n 50 --no-pager
+
+# Common reasons in the logs:
+# - "No space left on device" → disk exhaustion
+# - "Address already in use" → port conflict
+# - "ModuleNotFoundError" → missing dependency
+# - "Permission denied" → file permission issue
+
+# Check if systemd tried to restart
+sudo systemctl status storage-breaker
+# Look for: "Started", "Stopped", "Failed", restart count
+
+# Check if there's a core dump
+coredumpctl list
+```
+
+---
+
+### Step D: Port Not Bound RCA
+
+```bash
+# What's on port 3000?
+sudo ss -lntp | grep :3000
+# Empty = nothing listening
+
+# What's on port 80?
+sudo ss -lntp | grep :80
+
+# Check if another process took the port
+sudo lsof -i :3000
+
+# Check Nginx error log for upstream errors
+sudo tail -20 /var/log/nginx/storage-breaker-error.log
+# Common: "connect() failed (111: Connection refused) 
+#          while connecting to upstream"
+```
+
+---
+
+### Step E: Application Error RCA
+
+```bash
+# Test the app directly (bypass Nginx)
+curl -i http://127.0.0.1:3000/health
+
+# If it returns 503, check the app's own logs
+sudo tail -50 /var/log/storage-breaker/application.log
+
+# Check the health endpoint logic
+# The app checks: disk usage ≥ 95% OR writer status is disk_full/write_failed
+
+# Check the writer state
+curl -s http://127.0.0.1:3000/health | python3 -m json.tool
+
+# Check if there are Python errors
+sudo journalctl -u storage-breaker -n 100 | grep -i "error\|traceback\|exception"
+```
+
+---
+
+### Step F: Network/Nginx RCA
+
+```bash
+# Test Nginx directly
+curl -i http://127.0.0.1/health
+
+# If Nginx returns 502 (Bad Gateway):
+# - Uvicorn is not running or not on port 3000
+sudo ss -lntp | grep :3000
+
+# If Nginx returns 504 (Gateway Timeout):
+# - App is too slow to respond
+# Check Nginx timeouts
+sudo grep -r "proxy_read_timeout\|proxy_connect_timeout" /etc/nginx/
+
+# If Nginx returns 503:
+# - Nginx can't reach upstream
+# Check Nginx config
+sudo nginx -t
+sudo cat /etc/nginx/sites-enabled/storage-breaker
+
+# Check Nginx is running
+sudo systemctl status nginx
+```
+
+---
+
+### Step G: Load Balancer / Target Group RCA
+
+```bash
+# Check if target group health shows unhealthy
+aws elbv2 describe-target-health \
+    --target-group-arn arn:aws:elasticloadbalancing:REGION:ACCOUNT:targetgroup/NAME/ID
+
+# Check if the instance is registered
+aws ec2 describe-instance-status \
+    --instance-ids i-XXXXXXXXXXXXXXXXX
+
+# Check CloudWatch metrics for the ALB
+aws cloudwatch get-metric-statistics \
+    --namespace AWS/ApplicationELB \
+    --metric-name TargetResponseTime \
+    --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
+    --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+    --period 60 \
+    --statistics Average \
+    --dimensions Name=LoadBalancer,Value=app/NAME/ID
+```
+
+---
+
+### Correlate the Timeline
+
+Build a timeline of events to confirm the root cause.
+
+```
+TIME        EVENT                           EVIDENCE
+────        ─────                           ────────
+14:00       App deployed, healthy           df -h: 28% disk
+14:15       Log file starts growing         ls -lh: 50MB
+14:30       Log file reaches 2GB            ls -lh: 2GB
+14:45       Log file reaches 5GB            df -h: 80%
+14:50       Log file reaches 7GB            df -h: 95%
+14:52       Health check returns 503        curl: 503 Service Unavailable
+14:52       Writer status: disk_full        curl /health: {"status":"unhealthy"}
+14:55       Operator SSH'd in               SSH log
+14:58       Truncated log, restarted        df -h: 28%
+15:00       Health check returns 200        curl: 200 OK
+```
 
 ---
 
@@ -494,7 +420,7 @@ Then → Free disk space → Restart → Verify
 
 ## Temporary Resolution (Emergency Recovery)
 
-Use this when the root filesystem is already at or near 100%. The goal is to restore service as quickly as possible.
+Use this when the root filesystem is already at or near 100%. The goal is to restore service as quickly as possible. These steps apply to disk exhaustion — the most common cause of health check failures.
 
 ### Step 1: Stop the Application
 
@@ -766,6 +692,252 @@ Exactly one Uvicorn worker must be running:
 pgrep -af uvicorn
 # Expected: one line showing uvicorn with --workers 1
 ```
+
+---
+
+## Long-Term Resolution (Permanent Fixes)
+
+These changes prevent the failure from recurring. Implement one or more based on your operational requirements.
+
+### Fix 1: Dedicated EBS Volume for Logs (Recommended)
+
+Isolate application logs from the root filesystem so OS stability is never at risk.
+
+**Architecture:**
+
+```
+Root EBS volume (/dev/root)
+├── Operating system
+├── Nginx
+└── Python application
+
+Dedicated log EBS volume (/dev/nvme1n1)
+└── /var/log/storage-breaker
+```
+
+**Steps:**
+
+1. Create a new gp3 EBS volume in the same Availability Zone as the EC2 instance
+2. Attach the volume to the instance
+3. Identify the device:
+
+```bash
+lsblk
+```
+
+4. Format the new volume (only if empty):
+
+```bash
+sudo mkfs.ext4 /dev/nvme1n1
+```
+
+5. Stop the application:
+
+```bash
+sudo systemctl stop storage-breaker
+```
+
+6. Back up and recreate the mount point:
+
+```bash
+sudo mv /var/log/storage-breaker /var/log/storage-breaker.backup
+sudo mkdir -p /var/log/storage-breaker
+```
+
+7. Mount and set permissions:
+
+```bash
+sudo mount /dev/nvme1n1 /var/log/storage-breaker
+sudo chown -R ubuntu:ubuntu /var/log/storage-breaker
+sudo chmod 750 /var/log/storage-breaker
+```
+
+8. Configure automatic mount in `/etc/fstab`:
+
+```bash
+sudo blkid /dev/nvme1n1
+# Note the UUID
+
+sudo cp /etc/fstab /etc/fstab.backup
+sudo nano /etc/fstab
+```
+
+Add:
+
+```
+UUID=<your-uuid> /var/log/storage-breaker ext4 defaults,nofail 0 2
+```
+
+9. Test the fstab entry:
+
+```bash
+sudo umount /var/log/storage-breaker
+sudo mount -a
+df -h /var/log/storage-breaker
+```
+
+10. Start the application and verify:
+
+```bash
+sudo systemctl start storage-breaker
+curl -i http://EC2_PUBLIC_IP/health
+```
+
+11. Clean up the backup after confirming everything works:
+
+```bash
+sudo rm -rf /var/log/storage-breaker.backup
+```
+
+**Benefit:** Application log growth cannot affect the operating system, Nginx, or SSH access.
+
+---
+
+### Fix 2: Increase Root EBS Volume
+
+When more total storage is needed on the root filesystem.
+
+**Steps:**
+
+1. Modify the volume size in AWS Console: `EC2 → Volumes → Actions → Modify volume`
+2. Extend the partition on the instance:
+
+```bash
+sudo apt install -y cloud-guest-utils
+sudo growpart /dev/nvme0n1 1
+```
+
+3. Extend the filesystem:
+
+```bash
+# ext4
+sudo resize2fs /dev/nvme0n1p1
+
+# XFS
+sudo xfs_growfs -d /
+```
+
+4. Verify:
+
+```bash
+df -h /
+```
+
+**Caveat:** This delays exhaustion but does not prevent it. Use alongside log rotation or a dedicated volume.
+
+---
+
+### Fix 3: Configure Log Rotation
+
+For normal production logging where logs should not grow indefinitely.
+
+```bash
+sudo nano /etc/logrotate.d/storage-breaker
+```
+
+Configuration:
+
+```
+/var/log/storage-breaker/application.log {
+    size 100M
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 0640 ubuntu ubuntu
+}
+```
+
+| Setting | Purpose |
+| ------- | ------- |
+| `size 100M` | Rotate when file reaches 100 MB |
+| `rotate 7` | Keep 7 rotated files |
+| `compress` | Compress old logs (saves space) |
+| `delaycompress` | Keep most recent rotated file uncompressed |
+| `copytruncate` | Copy-then-truncate so the app keeps writing to the same path |
+
+Test:
+
+```bash
+sudo logrotate -d /etc/logrotate.d/storage-breaker
+sudo logrotate -f /etc/logrotate.d/storage-breaker
+ls -lh /var/log/storage-breaker
+```
+
+**Note:** For this specific drill, log rotation is intentionally disabled because the application is designed to fill the disk. Use log rotation only in production scenarios.
+
+---
+
+### Fix 4: Application-Level Disk Threshold
+
+Add a safety check inside the application to stop writing before the disk is full.
+
+```python
+import shutil
+from pathlib import Path
+
+LOG_DIRECTORY = Path("/var/log/storage-breaker")
+STOP_WRITING_THRESHOLD_PERCENT = 92.0
+HEALTH_FAILURE_THRESHOLD_PERCENT = 90.0
+
+
+def get_disk_usage_percent() -> float:
+    usage = shutil.disk_usage(LOG_DIRECTORY)
+    if usage.total == 0:
+        return 0.0
+    return (usage.used / usage.total) * 100
+
+
+def should_stop_writing() -> bool:
+    return get_disk_usage_percent() >= STOP_WRITING_THRESHOLD_PERCENT
+```
+
+**Threshold design:**
+
+```
+Disk usage < 90%  → healthy, writing logs
+90% ≤ usage < 92% → unhealthy (health check returns 503), still writing
+usage ≥ 92%       → stop writing, preserve OS stability
+```
+
+**Benefit:** The application proactively protects the OS, giving operators time to intervene before a full outage.
+
+---
+
+### Fix 5: systemd Journal Size Limits
+
+Protect the system journal from unbounded growth (does not control application-specific log files):
+
+```bash
+sudo nano /etc/systemd/journald.conf
+```
+
+```ini
+[Journal]
+SystemMaxUse=500M
+SystemKeepFree=1G
+```
+
+```bash
+sudo systemctl restart systemd-journald
+sudo journalctl --disk-usage
+```
+
+---
+
+## Decision Matrix
+
+| Scenario | Recommended Action |
+| -------- | ------------------ |
+| Disk is already full, need immediate recovery | **Temporary Resolution** — stop, truncate, restart |
+| Production application with normal logging | **Fix 3** — log rotation |
+| Application intentionally generates large logs | **Fix 1** — dedicated EBS volume |
+| Need more room on root filesystem | **Fix 2** — increase root EBS |
+| Want to prevent exhaustion at the source | **Fix 4** — application-level threshold |
+| Protecting system journal | **Fix 5** — journald limits |
+| Full production hardening | **Fix 1 + Fix 3 + Fix 4** combined |
 
 ---
 
@@ -1090,252 +1262,6 @@ Fluent Bit → CloudWatch Logs (alerting + search)
            + logrotate (cap local size at 100MB)
            + dedicated EBS volume (isolate from root)
 ```
-
----
-
-## Long-Term Resolution (Permanent Fixes)
-
-These changes prevent the failure from recurring. Implement one or more based on your operational requirements.
-
-### Fix 1: Dedicated EBS Volume for Logs (Recommended)
-
-Isolate application logs from the root filesystem so OS stability is never at risk.
-
-**Architecture:**
-
-```
-Root EBS volume (/dev/root)
-├── Operating system
-├── Nginx
-└── Python application
-
-Dedicated log EBS volume (/dev/nvme1n1)
-└── /var/log/storage-breaker
-```
-
-**Steps:**
-
-1. Create a new gp3 EBS volume in the same Availability Zone as the EC2 instance
-2. Attach the volume to the instance
-3. Identify the device:
-
-```bash
-lsblk
-```
-
-4. Format the new volume (only if empty):
-
-```bash
-sudo mkfs.ext4 /dev/nvme1n1
-```
-
-5. Stop the application:
-
-```bash
-sudo systemctl stop storage-breaker
-```
-
-6. Back up and recreate the mount point:
-
-```bash
-sudo mv /var/log/storage-breaker /var/log/storage-breaker.backup
-sudo mkdir -p /var/log/storage-breaker
-```
-
-7. Mount and set permissions:
-
-```bash
-sudo mount /dev/nvme1n1 /var/log/storage-breaker
-sudo chown -R ubuntu:ubuntu /var/log/storage-breaker
-sudo chmod 750 /var/log/storage-breaker
-```
-
-8. Configure automatic mount in `/etc/fstab`:
-
-```bash
-sudo blkid /dev/nvme1n1
-# Note the UUID
-
-sudo cp /etc/fstab /etc/fstab.backup
-sudo nano /etc/fstab
-```
-
-Add:
-
-```
-UUID=<your-uuid> /var/log/storage-breaker ext4 defaults,nofail 0 2
-```
-
-9. Test the fstab entry:
-
-```bash
-sudo umount /var/log/storage-breaker
-sudo mount -a
-df -h /var/log/storage-breaker
-```
-
-10. Start the application and verify:
-
-```bash
-sudo systemctl start storage-breaker
-curl -i http://EC2_PUBLIC_IP/health
-```
-
-11. Clean up the backup after confirming everything works:
-
-```bash
-sudo rm -rf /var/log/storage-breaker.backup
-```
-
-**Benefit:** Application log growth cannot affect the operating system, Nginx, or SSH access.
-
----
-
-### Fix 2: Increase Root EBS Volume
-
-When more total storage is needed on the root filesystem.
-
-**Steps:**
-
-1. Modify the volume size in AWS Console: `EC2 → Volumes → Actions → Modify volume`
-2. Extend the partition on the instance:
-
-```bash
-sudo apt install -y cloud-guest-utils
-sudo growpart /dev/nvme0n1 1
-```
-
-3. Extend the filesystem:
-
-```bash
-# ext4
-sudo resize2fs /dev/nvme0n1p1
-
-# XFS
-sudo xfs_growfs -d /
-```
-
-4. Verify:
-
-```bash
-df -h /
-```
-
-**Caveat:** This delays exhaustion but does not prevent it. Use alongside log rotation or a dedicated volume.
-
----
-
-### Fix 3: Configure Log Rotation
-
-For normal production logging where logs should not grow indefinitely.
-
-```bash
-sudo nano /etc/logrotate.d/storage-breaker
-```
-
-Configuration:
-
-```
-/var/log/storage-breaker/application.log {
-    size 100M
-    rotate 7
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-    create 0640 ubuntu ubuntu
-}
-```
-
-| Setting | Purpose |
-| ------- | ------- |
-| `size 100M` | Rotate when file reaches 100 MB |
-| `rotate 7` | Keep 7 rotated files |
-| `compress` | Compress old logs (saves space) |
-| `delaycompress` | Keep most recent rotated file uncompressed |
-| `copytruncate` | Copy-then-truncate so the app keeps writing to the same path |
-
-Test:
-
-```bash
-sudo logrotate -d /etc/logrotate.d/storage-breaker
-sudo logrotate -f /etc/logrotate.d/storage-breaker
-ls -lh /var/log/storage-breaker
-```
-
-**Note:** For this specific drill, log rotation is intentionally disabled because the application is designed to fill the disk. Use log rotation only in production scenarios.
-
----
-
-### Fix 4: Application-Level Disk Threshold
-
-Add a safety check inside the application to stop writing before the disk is full.
-
-```python
-import shutil
-from pathlib import Path
-
-LOG_DIRECTORY = Path("/var/log/storage-breaker")
-STOP_WRITING_THRESHOLD_PERCENT = 92.0
-HEALTH_FAILURE_THRESHOLD_PERCENT = 90.0
-
-
-def get_disk_usage_percent() -> float:
-    usage = shutil.disk_usage(LOG_DIRECTORY)
-    if usage.total == 0:
-        return 0.0
-    return (usage.used / usage.total) * 100
-
-
-def should_stop_writing() -> bool:
-    return get_disk_usage_percent() >= STOP_WRITING_THRESHOLD_PERCENT
-```
-
-**Threshold design:**
-
-```
-Disk usage < 90%  → healthy, writing logs
-90% ≤ usage < 92% → unhealthy (health check returns 503), still writing
-usage ≥ 92%       → stop writing, preserve OS stability
-```
-
-**Benefit:** The application proactively protects the OS, giving operators time to intervene before a full outage.
-
----
-
-### Fix 5: systemd Journal Size Limits
-
-Protect the system journal from unbounded growth (does not control application-specific log files):
-
-```bash
-sudo nano /etc/systemd/journald.conf
-```
-
-```ini
-[Journal]
-SystemMaxUse=500M
-SystemKeepFree=1G
-```
-
-```bash
-sudo systemctl restart systemd-journald
-sudo journalctl --disk-usage
-```
-
----
-
-## Decision Matrix
-
-| Scenario | Recommended Action |
-| -------- | ------------------ |
-| Disk is already full, need immediate recovery | **Temporary Resolution** — stop, truncate, restart |
-| Production application with normal logging | **Fix 3** — log rotation |
-| Application intentionally generates large logs | **Fix 1** — dedicated EBS volume |
-| Need more room on root filesystem | **Fix 2** — increase root EBS |
-| Want to prevent exhaustion at the source | **Fix 4** — application-level threshold |
-| Protecting system journal | **Fix 5** — journald limits |
-| Full production hardening | **Fix 1 + Fix 3 + Fix 4** combined |
 
 ---
 
