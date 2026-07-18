@@ -298,6 +298,200 @@ Disk Usage    System Behavior                          Detection Signal
 
 ---
 
+## No Monitoring? Troubleshooting From Scratch
+
+In many real-world scenarios, you get paged for a 503 and there's no dashboard, no alerts, no history. You're flying blind. Here's the systematic approach.
+
+### Phase 1: First 60 Seconds — Confirm the Problem
+
+You received an alert (or a user complaint). Before touching anything, confirm what's broken.
+
+```bash
+# 1. Can you even SSH in?
+ssh -i key.pem ubuntu@EC2_PUBLIC_IP
+
+# 2. Check the health endpoint
+curl -i http://EC2_PUBLIC_IP/health
+# 503 = something is wrong
+# Connection refused = service is down entirely
+
+# 3. Check if the service is running
+sudo systemctl status storage-breaker
+# active (running) = service is up, problem may be elsewhere
+# inactive/failed = service is down
+```
+
+**At this point you know:**
+- SSH works → OS is not fully hung
+- 503 from health check → application sees a problem
+- Service status → whether it's running or crashed
+
+---
+
+### Phase 2: Quick Triage — Find the Category
+
+Run these 4 commands to narrow down the issue:
+
+```bash
+# 1. Disk space (most common for 503)
+df -h /
+
+# 2. Memory
+free -h
+
+# 3. CPU / load
+uptime
+
+# 4. Service process
+pgrep -af uvicorn
+```
+
+**Interpret the results:**
+
+| df -h shows | free -h shows | uptime shows | Likely cause |
+|-------------|---------------|--------------|--------------|
+| ≥ 95% disk | Normal | Normal | **Disk exhaustion** |
+| Normal | Normal | Normal | Application bug or config issue |
+| Normal | Normal | High load | CPU-bound or infinite loop |
+| Normal | High swap | Normal | Memory leak |
+
+---
+
+### Phase 3: Deep Dive — Confirm Root Cause
+
+If disk is the problem, investigate further:
+
+```bash
+# What's using the disk?
+sudo du -xhd1 / 2>/dev/null | sort -rh | head -10
+```
+
+Example output:
+```
+8.2G    /var
+2.4G    /usr
+1.1G    /opt
+```
+
+→ `/var` is the problem. Drill down:
+
+```bash
+sudo du -sh /var/*
+```
+
+```
+8.0G    /var/log
+```
+
+→ `/var/log` is the problem. Drill down:
+
+```bash
+sudo du -sh /var/log/*
+```
+
+```
+7.8G    /var/log/storage-breaker
+```
+
+→ Found it. Check the file:
+
+```bash
+sudo ls -lh /var/log/storage-breaker/application.log
+```
+
+```
+-rw-r----- 1 ubuntu ubuntu 7.8G Jul 17 14:12 application.log
+```
+
+**Root cause confirmed: Application log file consumed 7.8 GB of an 8.7 GB root volume.**
+
+---
+
+### Phase 4: Check for Cascade Damage
+
+Disk exhaustion often breaks other things. Check before declaring victory:
+
+```bash
+# Can systemd write journal logs?
+sudo journalctl -n 5
+
+# Can Nginx write logs?
+sudo tail -5 /var/log/nginx/storage-breaker-error.log
+
+# Are there deleted-but-open files holding space?
+sudo lsof +L1
+
+# Are inodes exhausted too?
+df -ih
+```
+
+---
+
+### Phase 5: Decision — Fix or Mitigate?
+
+```
+Is the service still running?
+    │
+    ├── YES → Stop it first (stop the bleeding)
+    │         sudo systemctl stop storage-breaker
+    │
+    └── NO → Check why it stopped
+              sudo journalctl -u storage-breaker -n 50
+              (may show "No space left on device" errors)
+
+Then → Free disk space → Restart → Verify
+```
+
+---
+
+### Quick Reference: Troubleshooting Commands
+
+| Command | What it tells you |
+|---------|-------------------|
+| `df -h /` | Is disk full? |
+| `df -ih` | Are inodes exhausted? |
+| `free -h` | Is memory the issue? |
+| `uptime` | Is the system overloaded? |
+| `sudo du -xhd1 / \| sort -rh \| head -10` | What directory is largest? |
+| `sudo ls -lh /var/log/storage-breaker/` | How big is the log file? |
+| `pgrep -af uvicorn` | Is the app running? How many workers? |
+| `sudo systemctl status storage-breaker` | Service state |
+| `sudo journalctl -u storage-breaker -n 50` | Recent service logs |
+| `sudo lsof +L1` | Deleted files still open |
+| `sudo ss -lntp \| grep -E ':80\|:3000'` | Are ports listening? |
+| `curl -i http://127.0.0.1:3000/health` | Health check from inside |
+
+---
+
+### Troubleshooting Flowchart
+
+```
+                    503 Health Check
+                          │
+                    ┌─────┴─────┐
+                    │           │
+              SSH works?    SSH fails?
+                 │              │
+            ┌────┴────┐    OS is hung or
+            │         │    network issue
+        Service     Service
+        running?    crashed?
+            │         │
+       ┌────┴───┐    journalctl -u storage-breaker
+       │        │    (check why it crashed)
+   df -h     free -h
+   disk?     memory?
+       │        │
+  ┌────┴───┐   ┌┴────────┐
+  │        │   │          │
+ ≥95%    Normal  High    Normal
+  │       │     swap     │
+ DU full  App    OOM     App bug
+          bug    kill
+```
+
+---
+
 ## Temporary Resolution (Emergency Recovery)
 
 Use this when the root filesystem is already at or near 100%. The goal is to restore service as quickly as possible.
