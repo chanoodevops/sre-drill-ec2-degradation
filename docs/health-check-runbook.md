@@ -1488,4 +1488,6 @@ Regularly test your recovery procedures:
 |----------|-------------|
 | [Deployment Guide](deployment.md) | Infrastructure setup and application deployment |
 | [API Reference](api-reference.md) | Application endpoint documentation |
+| [Systemd Guide](systemd-guide.md) | Service management, logging, and security |
+| [Nginx Guide](nginx-guide.md) | Reverse proxy, HTTPS, Let's Encrypt, ACM |
 | [Disk Exhaustion Report](disk-exhaustion-report.md) | Enterprise guide: detection, recovery, and prevention |

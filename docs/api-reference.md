@@ -169,5 +169,7 @@ For non-ENOSPC errors:
 | Document | Description |
 |----------|-------------|
 | [Deployment Guide](deployment.md) | Infrastructure setup and application deployment |
+| [Systemd Guide](systemd-guide.md) | Service management, logging, and security |
+| [Nginx Guide](nginx-guide.md) | Reverse proxy, HTTPS, Let's Encrypt, ACM |
 | [Health Check Runbook](health-check-runbook.md) | Troubleshooting, RCA, and recovery procedures |
 | [Disk Exhaustion Report](disk-exhaustion-report.md) | Enterprise guide: detection, recovery, and prevention |

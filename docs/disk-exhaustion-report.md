@@ -714,6 +714,8 @@ Next update: [TIME] UTC
 |----------|-------------|
 | [Deployment Guide](deployment.md) | Infrastructure setup and application deployment |
 | [API Reference](api-reference.md) | Application endpoint documentation |
+| [Systemd Guide](systemd-guide.md) | Service management, logging, and security |
+| [Nginx Guide](nginx-guide.md) | Reverse proxy, HTTPS, Let's Encrypt, ACM |
 | [Health Check Runbook](health-check-runbook.md) | Troubleshooting, RCA, and recovery procedures |
 
 ---

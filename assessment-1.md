@@ -154,5 +154,7 @@ Submit the following:
 |----------|-------------|
 | [Deployment Guide](docs/deployment.md) | Infrastructure setup and application deployment |
 | [API Reference](docs/api-reference.md) | Application endpoint documentation |
+| [Systemd Guide](docs/systemd-guide.md) | Service management, logging, and security |
+| [Nginx Guide](docs/nginx-guide.md) | Reverse proxy, HTTPS, Let's Encrypt, ACM |
 | [Health Check Runbook](docs/health-check-runbook.md) | Troubleshooting, RCA, and recovery procedures |
 | [Disk Exhaustion Report](docs/disk-exhaustion-report.md) | Enterprise guide: detection, recovery, and prevention |
