@@ -234,22 +234,92 @@ df -ih
 ```bash
 # Check memory usage
 free -h
-
-# Check for OOM kills
-sudo journalctl -k | grep -i "out of memory"
-dmesg | grep -i "oom"
-
-# Check which process used the most memory
-ps aux --sort=-%mem | head -10
-
-# Check swap usage
-swapon --show
 ```
 
+**Example output (memory exhausted):**
+```
+               total        used        free      shared  buff/cache   available
+Mem:           985Mi       950Mi        12Mi         8Mi        23Mi        15Mi
+Swap:             0B          0B          0B
+```
+
+```bash
+# Check for OOM kills (kernel log)
+dmesg | grep -i "oom\|killed\|out of memory"
+```
+
+**Expected output (OOM confirmed):**
+```
+[12345.678] Out of memory: Killed process 1234 (python3) total-vm:1234567kB, anon-rss:1023456kB
+```
+
+```bash
+# Check which process used the most memory
+ps aux --sort=-%mem | head -10
+```
+
+**Expected output:**
+```
+USER       PID  %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+ubuntu    1234  45.2 68.5 1234567 685432 ?      Sl   10:00  15:23 python3 -m uvicorn app:app
+root        567  2.1  8.3  83456  83456 ?        Ss   09:58   1:12 /usr/sbin/nginx
+```
+
+```bash
+# Check swap usage
+swapon --show
+# Empty output = no swap configured (high risk of OOM)
+
+# Check systemd death record
+sudo journalctl -u storage-breaker --since "30 min ago" --no-pager | tail -20
+# Look for: "Main process exited, code=killed, status=9/KILL"
+
+# Check how many workers are running
+pgrep -c uvicorn
+# If > 1, multiple workers are consuming memory
+
+# Check the service file for worker configuration
+grep -i "workers\|ExecStart" /etc/systemd/system/storage-breaker.service
+```
+
+**Root cause confirmed:** The system has insufficient RAM for the configured workload, and the OOM Killer terminated the Uvicorn worker.
+
 **Root cause candidates:**
-- Memory leak in application
-- Too many workers/processes
-- Insufficient instance size for workload
+- Undersized instance (t2.micro with 1 GiB RAM is insufficient for sustained load)
+- Too many Uvicorn workers (`--workers` > 1 on small instances)
+- Memory leak in application or dependency
+- Other processes consuming RAM (unmonitored services)
+- Swap disabled or too small
+
+**Emergency recovery (if OOM confirmed):**
+
+```bash
+# 1. Add emergency swap (2 GB) as a safety buffer
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
+sudo sysctl vm.swappiness=10
+
+# 2. Add systemd memory guard
+sudo systemctl edit storage-breaker
+# Add:
+# [Service]
+# MemoryMax=768M
+# MemoryHigh=512M
+
+# 3. Reload and restart
+sudo systemctl daemon-reload
+sudo systemctl restart storage-breaker
+sleep 3
+
+# 4. Verify
+free -h
+curl -i http://EC2_PUBLIC_IP/health
+# Expected: HTTP/1.1 200 OK
+```
 
 ---
 
@@ -695,6 +765,83 @@ pgrep -af uvicorn
 
 ---
 
+## Memory Exhaustion Temporary Resolution (Emergency Recovery)
+
+Use this when the OOM Killer has terminated the Uvicorn worker and the health check returns 502/503 due to memory exhaustion.
+
+### Step 1: Confirm OOM is the Root Cause
+
+```bash
+# Check for OOM kills
+dmesg | grep -i "oom\|killed"
+sudo journalctl -u storage-breaker -n 20 --no-pager | grep -i "killed\|signal"
+```
+
+### Step 2: Add Emergency Swap
+
+```bash
+# Create 2 GB swap file
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+
+# Make persistent
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+# Set low swappiness (prefer RAM, swap is safety net)
+echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
+sudo sysctl vm.swappiness=10
+
+# Verify
+free -h
+swapon --show
+```
+
+### Step 3: Add Systemd Memory Guard
+
+```bash
+sudo systemctl edit storage-breaker
+```
+
+Add:
+```ini
+[Service]
+MemoryMax=768M
+MemoryHigh=512M
+```
+
+### Step 4: Restart and Verify
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart storage-breaker
+sleep 3
+
+# Verify service is running
+pgrep -af uvicorn
+# Expected: single uvicorn process
+
+# Verify memory limits
+systemctl show storage-breaker | grep -E "MemoryMax|MemoryHigh"
+
+# Verify health
+curl -i http://EC2_PUBLIC_IP/health
+# Expected: HTTP/1.1 200 OK
+```
+
+### Memory Exhaustion Recovery Checklist
+
+- [ ] OOM confirmed (`dmesg | grep -i oom` shows killed process)
+- [ ] Swap added (`swapon --show` shows active swap)
+- [ ] Memory limits set (`MemoryMax` and `MemoryHigh` in systemd)
+- [ ] Service restarted (`systemctl status` shows active)
+- [ ] Health endpoint returns `200 OK`
+- [ ] Single Uvicorn worker running
+- [ ] Service stable for 5 minutes without OOM events
+
+---
+
 ## Long-Term Resolution (Permanent Fixes)
 
 These changes prevent the failure from recurring. Implement one or more based on your operational requirements.
@@ -927,17 +1074,98 @@ sudo journalctl --disk-usage
 
 ---
 
+### Fix 6: Right-Size Instance + Systemd Memory Guard
+
+When memory exhaustion is caused by insufficient RAM rather than a leak.
+
+**Step 1: Right-Size the Instance**
+
+```bash
+# Stop the instance
+aws ec2 stop-instances --instance-ids i-XXXXXXXXXXXXXXXXX
+
+# Modify instance type (t2.micro → t3.small)
+aws ec2 modify-instance-attribute \
+    --instance-id i-XXXXXXXXXXXXXXXXX \
+    --instance-type t3.small
+
+# Start the instance
+aws ec2 start-instances --instance-ids i-XXXXXXXXXXXXXXXXX
+```
+
+**Memory Comparison:**
+
+| Instance | RAM | Available for App | Recommended |
+|----------|-----|-------------------|-------------|
+| t2.micro | 1 GiB | ~700 MiB | ❌ Insufficient |
+| t3.small | 2 GiB | ~1.7 GiB | ✅ Minimum |
+| t3.medium | 4 GiB | ~3.7 GiB | ✅ Production |
+
+**Step 2: Add Systemd Memory Guard**
+
+```bash
+sudo systemctl edit storage-breaker
+```
+
+Add:
+```ini
+[Service]
+MemoryMax=1024M
+MemoryHigh=768M
+CPUQuota=80%
+LimitNOFILE=4096
+LimitNPROC=256
+```
+
+**Step 3: Limit Uvicorn Concurrency**
+
+```bash
+sudo systemctl edit storage-breaker --force
+```
+
+Update ExecStart:
+```ini
+[Service]
+ExecStart=
+ExecStart=/opt/storage-breaker/venv/bin/uvicorn app:app \
+    --host 127.0.0.1 \
+    --port 3000 \
+    --workers 1 \
+    --limit-concurrency 50 \
+    --timeout-keep-alive 30 \
+    --backlog 20
+```
+
+**Step 4: Enable and Verify**
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart storage-breaker
+sleep 3
+
+# Verify memory limits
+systemctl show storage-breaker | grep -E "MemoryMax|MemoryHigh"
+
+# Verify service is healthy
+curl -i http://EC2_PUBLIC_IP/health
+# Expected: HTTP/1.1 200 OK
+```
+
+---
+
 ## Decision Matrix
 
 | Scenario | Recommended Action |
 | -------- | ------------------ |
 | Disk is already full, need immediate recovery | **Temporary Resolution** — stop, truncate, restart |
+| OOM killed the service, need immediate recovery | **Memory Exhaustion Temporary Resolution** — swap + memory guard |
 | Production application with normal logging | **Fix 3** — log rotation |
 | Application intentionally generates large logs | **Fix 1** — dedicated EBS volume |
 | Need more room on root filesystem | **Fix 2** — increase root EBS |
 | Want to prevent exhaustion at the source | **Fix 4** — application-level threshold |
 | Protecting system journal | **Fix 5** — journald limits |
-| Full production hardening | **Fix 1 + Fix 3 + Fix 4** combined |
+| Instance too small for workload | **Fix 6** — right-size instance |
+| Full production hardening | **Fix 1 + Fix 3 + Fix 4 + Fix 6** combined |
 
 ---
 
@@ -1293,6 +1521,9 @@ aws cloudwatch put-metric-data \
 | DiskUtilization ≥ 80% | Warning | SNS notification |
 | DiskUtilization ≥ 90% | Critical | Page on-call engineer |
 | DiskUtilization ≥ 95% | Emergency | Auto-recovery or escalation |
+| MemoryUtilization ≥ 80% | Warning | SNS notification |
+| MemoryUtilization ≥ 90% | Critical | Page on-call engineer |
+| OOMKillCount ≥ 1 | Immediate | Page on-call engineer |
 | HealthCheckStatus = unhealthy | Immediate | Page on-call engineer |
 
 **Custom Health Check Script (cron):**
@@ -1313,6 +1544,33 @@ fi
 ```bash
 # Run every 5 minutes
 */5 * * * * /usr/local/bin/disk-check.sh
+```
+
+**Memory Check Script (cron):**
+
+```bash
+#!/bin/bash
+# /usr/local/bin/memory-check.sh
+
+THRESHOLD=80
+USAGE=$(free | awk '/Mem/{printf "%.0f", $3/$2 * 100}')
+
+if [ "$USAGE" -ge "$THRESHOLD" ]; then
+    echo "MEMORY WARNING: System memory at ${USAGE}%" | \
+        logger -t memory-check
+fi
+
+# Check for recent OOM kills
+OOM_COUNT=$(dmesg | grep -c "Out of memory")
+if [ "$OOM_COUNT" -gt 0 ]; then
+    echo "OOM ALERT: ${OOM_COUNT} OOM kill(s) detected" | \
+        logger -t memory-check
+fi
+```
+
+```bash
+# Run every 5 minutes
+*/5 * * * * /usr/local/bin/memory-check.sh
 ```
 
 ### 2. Incident Response Runbook
@@ -1469,6 +1727,8 @@ Regularly test your recovery procedures:
 
 ## Recovery Verification Checklist
 
+### Disk Exhaustion Recovery
+
 - [ ] Service stopped cleanly (`pgrep -af uvicorn` returns nothing)
 - [ ] Disk space reclaimed (`df -h /` shows available space)
 - [ ] No deleted-but-open files (`sudo lsof +L1` is clean)
@@ -1476,6 +1736,19 @@ Regularly test your recovery procedures:
 - [ ] Health endpoint returns `200 OK`
 - [ ] Exactly one Uvicorn worker running
 - [ ] Log growth is being monitored
+- [ ] Root cause documented
+- [ ] Long-term fix identified and scheduled
+- [ ] Post-mortem completed (if production incident)
+
+### Memory Exhaustion Recovery
+
+- [ ] OOM confirmed (`dmesg | grep -i oom` shows killed process)
+- [ ] Swap added (`swapon --show` shows active swap)
+- [ ] Memory limits set (`MemoryMax` and `MemoryHigh` in systemd)
+- [ ] Service restarted (`systemctl status` shows active)
+- [ ] Health endpoint returns `200 OK`
+- [ ] Single Uvicorn worker running
+- [ ] Service stable for 5 minutes without OOM events
 - [ ] Root cause documented
 - [ ] Long-term fix identified and scheduled
 - [ ] Post-mortem completed (if production incident)
@@ -1491,3 +1764,4 @@ Regularly test your recovery procedures:
 | [Systemd Guide](systemd-guide.md) | Service management, logging, and security |
 | [Nginx Guide](nginx-guide.md) | Reverse proxy, HTTPS, Let's Encrypt, ACM |
 | [Disk Exhaustion Report](disk-exhaustion-report.md) | Enterprise guide: detection, recovery, and prevention |
+| [Memory Exhaustion Report](memory-exhaustion-report.md) | Enterprise guide: OOM detection, recovery, and prevention |

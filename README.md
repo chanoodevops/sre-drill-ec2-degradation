@@ -138,6 +138,7 @@ The `/health` endpoint returns:
 | [Nginx Guide](docs/nginx-guide.md) | Reverse proxy, HTTPS, Let's Encrypt, ACM |
 | [Health Check Runbook](docs/health-check-runbook.md) | Troubleshooting, RCA, and recovery procedures |
 | [Disk Exhaustion Report](docs/disk-exhaustion-report.md) | Enterprise guide: detection, recovery, and prevention |
+| [Memory Exhaustion Report](docs/memory-exhaustion-report.md) | Enterprise guide: OOM detection, recovery, and prevention |
 
 ## Important Constraints
 
