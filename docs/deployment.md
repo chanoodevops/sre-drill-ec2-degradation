@@ -334,7 +334,184 @@ ps -ef | grep uvicorn
 
 Confirm exactly **one** worker process is running.
 
+---
+
+## 13. Alternative: Dedicated Service Account (Production Standard)
+
+The default deployment runs the app as the `ubuntu` SSH user. This section documents the **production standard**: a dedicated system account with no login, no home directory, and no sudo.
+
+### 13.1 Create Service Account
+
+Run this **before cloning the repository** (before Step 3):
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin storage-breaker
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--system` | UID < 1000, no password expiry |
+| `--no-create-home` | No `/home/storage-breaker` |
+| `--shell /usr/sbin/nologin` | Cannot log in, cannot `su` directly |
+
+Verify:
+
+```bash
+id storage-breaker
+```
+
+Expected:
+
+```
+uid=998(storage-breaker) gid=998(storage-breaker) groups=998(storage-breaker)
+```
+
+### 13.2 Fix App Directory Ownership
+
+After cloning (Step 3), change ownership so `ubuntu` owns files but only the service account can run them:
+
+```bash
+sudo chown -R ubuntu:storage-breaker /opt/storage-breaker
+sudo chmod 750 /opt/storage-breaker
+sudo chmod 750 /opt/storage-breaker/.venv/bin/python
+```
+
+| Owner | Group | Perms | Result |
+|-------|-------|-------|--------|
+| `ubuntu` | `storage-breaker` | `750` | Deployer writes code via git. Service reads + executes. World blocked. |
+
+Verify:
+
+```bash
+ls -ld /opt/storage-breaker
+```
+
+Expected:
+
+```
+drwxr-x--- 3 ubuntu storage-breaker 4096 Jul 23 12:00 /opt/storage-breaker
+```
+
+### 13.3 Fix Log Directory Ownership
+
+After creating the log directory (Step 4), change to service account:
+
+```bash
+sudo chown storage-breaker:adm /var/log/storage-breaker
+sudo chmod 750 /var/log/storage-breaker
+```
+
+Group `adm` lets operators read logs without `sudo`.
+
+Verify:
+
+```bash
+ls -ld /var/log/storage-breaker
+```
+
+Expected:
+
+```
+drwxr-x--- 2 storage-breaker adm 4096 Jul 23 12:00 /var/log/storage-breaker
+```
+
+### 13.4 systemd Service File
+
+Replace the service file in Step 7 with this hardened version:
+
+```ini
+[Unit]
+Description=Storage Breaker FastAPI Service
+After=network.target
+
+[Service]
+Type=simple
+
+User=storage-breaker
+Group=storage-breaker
+SupplementaryGroups=
+
+WorkingDirectory=/opt/storage-breaker
+
+ExecStart=/opt/storage-breaker/.venv/bin/uvicorn app:app \
+    --host 127.0.0.1 \
+    --port 3000 \
+    --workers 1 \
+    --no-access-log
+
+Restart=always
+RestartSec=5
+
+Environment=PYTHONUNBUFFERED=1
+
+StandardOutput=journal
+StandardError=journal
+
+# --- Hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Drop all Linux capabilities
+CapabilityBoundingSet=
+
+# Read-only system paths
+ProtectSystem=strict
+ProtectHome=true
+
+# Only these paths are writable
+ReadWritePaths=/var/log/storage-breaker /opt/storage-breaker
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Key hardening directives:**
+
+| Directive | Effect |
+|-----------|--------|
+| `SupplementaryGroups=` | Empty — app inherits no extra groups |
+| `CapabilityBoundingSet=` | Cannot bind low ports, change ownership, or any privileged syscall |
+| `ProtectSystem=strict` | `/usr`, `/etc` read-only; whitelisted paths via `ReadWritePaths` |
+| `ProtectHome=true` | Cannot read `/home/ubuntu` — SSH keys stay safe |
+| `ReadWritePaths=` | Explicit whitelist — everything else is read-only |
+
+After updating, reload and restart:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart storage-breaker
+```
+
+Verify process runs as `storage-breaker`:
+
+```bash
+ps -ef | grep uvicorn | grep -v grep
+```
+
+Expected:
+
+```
+storage-+ 12345     1  0 12:00 ?        00:00:01 /opt/storage-breaker/.venv/bin/python ...
+```
+
+### 13.5 Security Comparison
+
+| Control | Option 1 (`ubuntu` user) | Option 2 (`storage-breaker`) |
+|---------|--------------------------|------------------------------|
+| SSH key exposure risk | App compromise reads `/home/ubuntu/.ssh` | `ProtectHome=true` blocks access |
+| Code tampering | App can modify its own source | App cannot write to `750` dirs |
+| Privilege escalation | `NoNewPrivileges=true` only | Same + empty capabilities |
+| Audit attribution | All actions as `ubuntu` | Distinct UID per service |
+| Log readability | `ubuntu` or `sudo` only | Group `adm` — no sudo needed |
+| Day-2 ops friction | Low — one user for SSH + deploy | Moderate — `sudo` for file changes |
+
+> **When to use which:** Option 1 for labs, dev, and training drills. Option 2 for production deployments. This drill scenario uses Option 1 for clarity, but teams should default to Option 2 in live environments.
+
+---
+
 ## Deployment Checklist
+
+### Option 1 (Development / Training)
 
 - [ ] Ubuntu updated
 - [ ] Python, Git, Nginx installed
@@ -348,6 +525,16 @@ Confirm exactly **one** worker process is running.
 - [ ] Security Group allows ports 22 and 80
 - [ ] Health endpoint returns `200 OK`
 - [ ] Exactly one Uvicorn worker running
+
+### Option 2 (Production)
+
+Same as Option 1 plus:
+
+- [ ] Service account `storage-breaker` created before clone
+- [ ] App directory ownership set to `ubuntu:storage-breaker` (750)
+- [ ] Log directory ownership set to `storage-breaker:adm` (750)
+- [ ] systemd unit updated with hardened directives (`CapabilityBoundingSet=`, `ProtectSystem=strict`, `ProtectHome=true`)
+- [ ] Process confirmed running as `storage-breaker` user
 
 ---
 
