@@ -507,6 +507,189 @@ storage-+ 12345     1  0 12:00 ?        00:00:01 /opt/storage-breaker/.venv/bin/
 
 > **When to use which:** Option 1 for labs, dev, and training drills. Option 2 for production deployments. This drill scenario uses Option 1 for clarity, but teams should default to Option 2 in live environments.
 
+### 13.6 Enterprise Hardening (Drop-in Layer)
+
+The base Option 2 unit is sufficient for staging. Production deployments add a **drop-in override** — the base unit stays untouched, and hardening directives layer on top. This pattern survives package upgrades and config management runs.
+
+#### 13.6.1 Create Drop-in Directory
+
+```bash
+sudo mkdir -p /etc/systemd/system/storage-breaker.service.d
+sudo tee /etc/systemd/system/storage-breaker.service.d/enterprise-hardening.conf <<'EOF'
+[Service]
+# --- Resource Limits ---
+MemoryMax=512M
+MemoryHigh=384M
+CPUQuota=50%
+TasksMax=32
+LimitNOFILE=4096
+
+# --- Seccomp ---
+# Block ~300+ syscalls (mount, reboot, kexec, module load, etc.)
+SystemCallFilter=@system-service
+# Block 32-bit syscall vectors (defense-in-depth)
+SystemCallArchitectures=native
+
+# --- Crash-loop Protection ---
+# Stop restarting after 3 failures in 60 seconds
+StartLimitIntervalSec=60
+StartLimitBurst=3
+# Notify monitoring on permanent failure
+StartLimitAction=none
+
+# --- Read-only Code Mount ---
+# App code is read-only at runtime — compromise cannot modify files
+BindReadOnlyPaths=/opt/storage-breaker
+# Writable tmpfs for runtime data (PID files, Unix sockets, etc.)
+RuntimeDirectory=storage-breaker
+RuntimeDirectoryMode=0750
+EOF
+```
+
+**Directive reference:**
+
+| Directive | Value | Effect |
+|-----------|-------|--------|
+| `MemoryMax` | `512M` | Hard OOM kill at 512 MB RSS |
+| `MemoryHigh` | `384M` | Soft throttle above 384 MB |
+| `CPUQuota` | `50%` | Maximum 1/2 CPU core |
+| `TasksMax` | `32` | Prevents fork bomb — cap processes per unit |
+| `LimitNOFILE` | `4096` | File descriptor ceiling for connection bursts |
+| `SystemCallFilter` | `@system-service` | Blocks ~300+ syscalls (mount, reboot, kexec, bpf) |
+| `SystemCallArchitectures` | `native` | Blocks 32-bit syscall vectors (defense-in-depth) |
+| `StartLimitIntervalSec` | `60` | Window for restart counting |
+| `StartLimitBurst` | `3` | Max restarts in window before permanent failure |
+| `BindReadOnlyPaths` | `/opt/storage-breaker` | Remounts app dir read-only at runtime |
+| `RuntimeDirectory` | `storage-breaker` | Creates `/run/storage-breaker` with lifecycle tied to unit |
+
+#### 13.6.2 Apply Drop-in
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart storage-breaker
+```
+
+Verify overrides applied:
+
+```bash
+systemctl show storage-breaker | grep -E '(MemoryMax|CPUQuota|TasksMax)' | sort
+```
+
+Expected:
+
+```
+CPUQuotaPerSecUSec=50000
+MemoryMax=536870912
+TasksMax=32
+```
+
+Verify read-only mount:
+
+```bash
+mount | grep storage-breaker
+```
+
+Expected:
+
+```
+/dev/nvme0n1p1 on /opt/storage-breaker type ext4 (ro,...)
+```
+
+#### 13.6.3 Log Retention (logrotate)
+
+systemd journal is a transport, not a retention policy. Enterprise configures logrotate:
+
+```bash
+sudo tee /etc/logrotate.d/storage-breaker <<'EOF'
+/var/log/storage-breaker/*.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 storage-breaker adm
+    sharedscripts
+    postrotate
+        systemctl kill -s USR1 storage-breaker 2>/dev/null || true
+    endscript
+}
+EOF
+```
+
+Test configuration:
+
+```bash
+sudo logrotate -d /etc/logrotate.d/storage-breaker
+```
+
+Expected output — dry-run, shows rotation path without executing:
+
+```
+rotating pattern: /var/log/storage-breaker/*.log  after 1 days (30 rotations)
+empty log files are not rotated, old logs are removed
+considering log /var/log/storage-breaker/access.log
+  log does not need rotating (log has been rotated at 2026-07-22 12:00)
+```
+
+| Directive | Reason |
+|-----------|--------|
+| `rotate 30` | 30-day retention — standard compliance minimum |
+| `compress` | gzip rotated logs — reduces archival size ~90% |
+| `create 0640 storage-breaker adm` | Perms survive rotation — no ownership drift |
+| `sharedscripts` | One `postrotate` call per run, not per file |
+
+> **Storage cost:** 100 MB/day logs compress to ~10 MB. 30-day retention = ~300 MB journal + ~300 MB compressed archive. Budget 1 GB for log storage on the root volume.
+
+#### 13.6.4 Audit Trail (auditd)
+
+Forensic trail for the service account — mandatory for SOC-2, ISO 27001, PCI-DSS:
+
+```bash
+sudo tee /etc/audit/rules.d/storage-breaker.rules <<'EOF'
+-w /opt/storage-breaker -p wa -k storage-breaker-code
+-w /var/log/storage-breaker -p wa -k storage-breaker-logs
+EOF
+
+sudo auditctl -R /etc/audit/rules.d/storage-breaker.rules
+```
+
+Verify rules loaded:
+
+```bash
+sudo auditctl -l | grep storage-breaker
+```
+
+Expected:
+
+```
+-w /opt/storage-breaker -p wa -k storage-breaker-code
+-w /var/log/storage-breaker -p wa -k storage-breaker-logs
+```
+
+Search audit log for service activity:
+
+```bash
+sudo ausearch -k storage-breaker-code --just-one
+```
+
+#### 13.6.5 Enterprise Comparison
+
+| Control | Base Option 2 | Enterprise Option 2 |
+|---------|---------------|---------------------|
+| Code mutation protection | Writable (`ReadWritePaths`) | Read-only (`BindReadOnlyPaths`) |
+| Memory limit | None | `MemoryMax=512M`, `MemoryHigh=384M` |
+| CPU limit | None | `CPUQuota=50%` |
+| Task limit | None | `TasksMax=32` |
+| FD limit | systemd default (usually 4096) | Explicit `LimitNOFILE=4096` |
+| Seccomp | None | `SystemCallFilter=@system-service` + native arch |
+| Crash-loop cap | Infinite restart | 3 failures in 60s → permanent failed state |
+| Log retention | journal only (no rotation) | logrotate: daily, 30-day, gzip |
+| Forensic audit | None | auditd rules per path |
+| Config method | Edits unit file directly | Drop-in override (survives updates) |
+
+> **Cost note:** auditd incurs ~1–3% CPU overhead on write-heavy paths. For a single-service EC2 instance, negligible. For large fleets, consider forwarding audit events to CloudWatch Logs with a 7-day retention filter to avoid unbounded journal growth.
+
 ---
 
 ## Deployment Checklist
@@ -535,6 +718,19 @@ Same as Option 1 plus:
 - [ ] Log directory ownership set to `storage-breaker:adm` (750)
 - [ ] systemd unit updated with hardened directives (`CapabilityBoundingSet=`, `ProtectSystem=strict`, `ProtectHome=true`)
 - [ ] Process confirmed running as `storage-breaker` user
+
+### Option 2 — Enterprise Hardening
+
+Same as Option 2 plus:
+
+- [ ] Drop-in directory created at `/etc/systemd/system/storage-breaker.service.d/`
+- [ ] Resource limits applied (`MemoryMax=512M`, `CPUQuota=50%`, `TasksMax=32`)
+- [ ] Seccomp filter enabled (`SystemCallFilter=@system-service`)
+- [ ] Crash-loop protection configured (`StartLimitBurst=3` in 60s)
+- [ ] App directory remounted read-only at runtime (`BindReadOnlyPaths`)
+- [ ] logrotate rule installed for `/var/log/storage-breaker/*.log`
+- [ ] auditd rules loaded for service paths
+- [ ] Drop-in verified with `systemctl show`
 
 ---
 
